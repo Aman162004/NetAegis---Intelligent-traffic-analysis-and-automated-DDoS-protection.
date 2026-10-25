@@ -8,21 +8,19 @@ from typing import List
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import uvicorn
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 app = FastAPI()
 
-# Absolute path resolution (always points to project_root/config/alerts.json)
+# Absolute path resolution
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ALERTS_FILE = os.path.join(BASE_DIR, "config", "alerts.json")
 
-# Ensure config directory and alerts.json file exist on launch
-os.makedirs(os.path.dirname(ALERTS_FILE), exist_ok=True)
-if not os.path.exists(ALERTS_FILE):
-    with open(ALERTS_FILE, 'w') as f:
-        json.dump({"malicious_ips": []}, f, indent=4)
-
-# Your official Slack Webhook URL
-SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/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"
+# Retrieve Slack Webhook from .env securely
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
 
 def send_slack_alert(ip_address):
     """Sends a real-time notification to your Slack channel when an IP is blocked."""
