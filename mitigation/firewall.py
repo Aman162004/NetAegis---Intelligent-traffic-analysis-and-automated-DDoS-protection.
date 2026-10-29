@@ -1,282 +1,373 @@
 import os
-import subprocess
 import json
-import requests
-import asyncio
 import random
-from typing import List
+import asyncio
+from typing import List, Dict
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import requests
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
 load_dotenv()
 
-app = FastAPI()
+# Webhook correctly assigned as a string
+SLACK_WEBHOOK_URL = "WEB HOOK URL HERE"
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../config/alerts.json")
 
-# Absolute path resolution
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ALERTS_FILE = os.path.join(BASE_DIR, "config", "alerts.json")
+app = FastAPI(title="NetAegis Cyber Command Center")
 
-# Retrieve Slack Webhook from .env securely
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def send_slack_alert(ip_address):
-    """Sends a real-time notification to your Slack channel when an IP is blocked."""
-    payload = {
-        "text": f" *NetAegis Alert*: Malicious traffic detected! IP `{ip_address}` has been BLOCKED by the Kali firewall."
+# Shared In-Memory State
+active_connections: List[WebSocket] = []
+blocked_ips: List[str] = []
+live_incoming_stream: List[Dict[str, str]] = []
+current_realtime_pps: int = 45
+total_threat_events = 0  # Dynamic counter for mitigation
+
+def load_alerts():
+    global blocked_ips
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                data = json.load(f)
+                blocked_ips = data.get("malicious_ips", [])
+        except Exception:
+            blocked_ips = []
+
+def save_alerts():
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump({"malicious_ips": blocked_ips}, f, indent=2)
+
+load_alerts()
+
+def apply_iptables_block(ip: str):
+    if ip in ["127.0.0.1", "localhost"]:
+        return
+    try:
+        os.system(f"sudo iptables -A INPUT -s {ip} -j DROP")
+    except Exception:
+        pass
+
+# Function to push notifications to your Slack channel
+def send_slack_alert(ip: str):
+    if not SLACK_WEBHOOK_URL:
+        return
+    slack_data = {
+        "text": f"🚨 *NETAEGIS THREAT BLOCKED* 🚨\nMalicious DDoS activity detected from IP: `{ip}`.\nFirewall action: *AUTOMATICALLY DROPPED*."
     }
     try:
-        requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
-        print(f"[+] Slack notification delivered for {ip_address}")
+        requests.post(SLACK_WEBHOOK_URL, json=slack_data, headers={'Content-Type': 'application/json'})
     except Exception as e:
-        print(f"[-] Failed to deliver Slack notification: {e}")
-
-def block_ip(ip_address):
-    """Executes the Linux iptables kernel command to drop traffic from the attacker IP."""
-    try:
-        print(f"[!] Threat Detected! Executing firewall drop rule for IP: {ip_address}")
-        subprocess.run(["sudo", "iptables", "-A", "INPUT", "-s", ip_address, "-j", "DROP"], check=True)
-        print(f"[+] Successfully blocked {ip_address} on network interface.")
-        return True
-    except subprocess.CalledProcessError as e:
-        print(f"[-] iptables execution failed: {e}")
-        return False
-
-def get_blocked_ips():
-    """Reads the malicious IP list from alerts.json reliably."""
-    try:
-        if os.path.exists(ALERTS_FILE):
-            with open(ALERTS_FILE, 'r') as f:
-                data = json.load(f)
-                return data.get("malicious_ips", [])
-    except Exception as e:
-        print(f"[-] Error reading {ALERTS_FILE}: {e}")
-    return []
-
-def update_alerts_file(ip_address):
-    """Logs the blocked IP into config/alerts.json to persist state."""
-    try:
-        blocked_ips = get_blocked_ips()
-        if ip_address not in blocked_ips:
-            blocked_ips.append(ip_address)
-            with open(ALERTS_FILE, 'w') as f:
-                json.dump({"malicious_ips": blocked_ips}, f, indent=4)
-            print(f"[+] Updated {ALERTS_FILE} with IP: {ip_address}")
-    except Exception as e:
-        print(f"[-] Error writing to {ALERTS_FILE}: {e}")
-
-# --- API Endpoints ---
+        print(f"Error sending Slack alert: {e}")
 
 @app.post("/alert")
 async def receive_alert(request: Request):
-    """Receives JSON alerts from Student 1's detection script."""
+    global blocked_ips, live_incoming_stream, current_realtime_pps, total_threat_events
     data = await request.json()
-    attacker_ip = data.get("ip")
+    ip = data.get("ip")
     
-    if attacker_ip:
-        success = block_ip(attacker_ip)
-        if success:
-            update_alerts_file(attacker_ip)
-            send_slack_alert(attacker_ip)
-            return {"status": "Blocked", "ip": attacker_ip}
+    total_threat_events += 1 # Dynamically scale threat count
+    
+    if ip and ip not in blocked_ips:
+        blocked_ips.append(ip)
+        save_alerts()
+        apply_iptables_block(ip)
+        
+        # Trigger the Slack alert when a new IP is blocked
+        send_slack_alert(ip)
+        
+        live_incoming_stream.insert(0, {"ip": ip, "status": "BLOCKED", "type": "DDoS Flood"})
+        if len(live_incoming_stream) > 15:
+            live_incoming_stream.pop()
             
-    return {"status": "Failed or Invalid IP"}
+        current_realtime_pps = random.randint(1500, 4500)
+        return {"status": "Blocked", "ip": ip}
+    return {"status": "Ignored", "ip": ip}
 
-@app.get("/api/stats")
-async def get_stats():
-    """Returns JSON live state (threats, real-time PPS, and heatmap metrics)."""
-    blocked_ips = get_blocked_ips()
-    has_threat = len(blocked_ips) > 0
+@app.post("/telemetry")
+async def receive_telemetry(request: Request):
+    global live_incoming_stream, current_realtime_pps
+    data = await request.json()
+    ip = data.get("ip")
+    pps = data.get("pps", 40)
     
-    # Real-time traffic simulation
-    current_pps = random.randint(4800, 5300) if has_threat else random.randint(40, 65)
-    
-    # Real-time node heat values
-    heatmap = []
-    for i in range(1, 17):
-        if has_threat and i in [5, 6, 7]:
-            heatmap.append(random.randint(85, 100))
-        else:
-            heatmap.append(random.randint(15, 35))
+    current_realtime_pps = pps
+    if ip:
+        status = "BLOCKED" if ip in blocked_ips else "ALLOWED"
+        live_incoming_stream.insert(0, {"ip": ip, "status": status, "type": "Traffic" if status=="ALLOWED" else "Threat"})
+        if len(live_incoming_stream) > 15:
+            live_incoming_stream.pop()
+    return {"status": "OK"}
 
-    return {
-        "blocked_ips": blocked_ips,
-        "blocked_count": len(blocked_ips),
-        "current_pps": current_pps,
-        "heatmap": heatmap,
-        "has_threat": has_threat
-    }
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
+    try:
+        while True:
+            await asyncio.sleep(1)
+            pps_display = current_realtime_pps + random.randint(-50, 50) if current_realtime_pps > 100 else random.randint(35, 75)
 
-# --- Dashboard Interface ---
+            # DYNAMIC HEATMAP: Maps actual IPs from the stream to grid intensities
+            heatmap_counts = [0] * 16
+            for item in live_incoming_stream:
+                try:
+                    # Map the last octet of the IP to one of the 16 nodes
+                    idx = int(item['ip'].split('.')[-1]) % 16
+                except:
+                    idx = sum(ord(c) for c in item['ip']) % 16
+                heatmap_counts[idx] += 1
+            
+            # Convert hits to percentages
+            max_count = max(heatmap_counts) if sum(heatmap_counts) > 0 else 1
+            heatmap_data = [int((count / max_count) * 100) for count in heatmap_counts]
+
+            payload = {
+                "blocked_count": len(blocked_ips),
+                "total_events": total_threat_events,
+                "blocked_ips": blocked_ips,
+                "current_pps": pps_display,
+                "has_threat": len(blocked_ips) > 0 or current_realtime_pps > 200,
+                "heatmap": heatmap_data,
+                "live_stream": live_incoming_stream[:10]
+            }
+            await websocket.send_text(json.dumps(payload))
+    except WebSocketDisconnect:
+        active_connections.remove(websocket)
 
 @app.get("/", response_class=HTMLResponse)
-async def dashboard():
-    html_content = """<!DOCTYPE html>
-<html>
-<head>
-    <title>NetAegis Real-Time Dashboard</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #ffffff; padding: 25px; margin: 0; }
-        h1 { color: #4da6ff; border-bottom: 1px solid #333; padding-bottom: 15px; margin-top: 0; font-weight: 600; }
-        h3 { color: #e0e0e0; margin-top: 0; margin-bottom: 15px; }
-        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
-        .panel { background-color: #1e1e1e; padding: 20px; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.5); border: 1px solid #2a2a2a; }
-        ul { list-style-type: none; padding-left: 0; margin: 0; }
-        .heatmap-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 10px; margin-top: 15px; }
-        .heatmap-cell { 
-            aspect-ratio: 1; 
-            border-radius: 6px; 
-            display: flex; 
-            align-items: center; 
-            justify-content: center; 
-            font-size: 11px; 
-            font-weight: bold; 
-            color: #fff;
-            transition: background-color 0.4s ease;
-        }
-        .status-badge { display: inline-block; padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: bold; float: right; }
-        .online { background-color: #00cc66; color: #000; }
-    </style>
-</head>
-<body>
-    <h1> NetAegis: Real-Time Traffic & Threat Intelligence Dashboard <span class="status-badge online">REAL-TIME ACTIVE</span></h1>
-    
-    <div class="grid">
-        <div class="panel">
-            <h3>Threat Logs:</h3>
-            <ul id="threatLogs"><li>Loading network state...</li></ul>
-        </div>
-        
-        <div class="panel">
-            <h3>Live Network Traffic (Packets / Sec):</h3>
-            <canvas id="trafficChart"></canvas>
-        </div>
-
-        <div class="panel">
-            <h3>Network Segment Heatmap (Live Intensity):</h3>
-            <p style="font-size: 12px; color: #aaa;">Colors adjust dynamically per second (Green = Normal, Red = High Traffic/Attack).</p>
-            <div class="heatmap-grid" id="heatmapGrid"></div>
-        </div>
-
-        <div class="panel">
-            <h3>Mitigation Summary:</h3>
-            <canvas id="attackChart"></canvas>
-        </div>
-    </div>
-
-    <script>
-        // 1. Init Heatmap Grid Cells
-        const heatmapGrid = document.getElementById('heatmapGrid');
-        const cells = [];
-        for (let i = 1; i <= 16; i++) {
-            const cell = document.createElement('div');
-            cell.className = 'heatmap-cell';
-            cell.innerText = '.10' + i;
-            cell.style.backgroundColor = 'rgba(0, 150, 102, 0.5)';
-            heatmapGrid.appendChild(cell);
-            cells.push(cell);
-        }
-
-        // 2. Init Bar Chart
-        const ctxBar = document.getElementById('attackChart').getContext('2d');
-        const attackChart = new Chart(ctxBar, {
-            type: 'bar',
-            data: {
-                labels: ['Total Blocked Attacks'],
-                datasets: [{
-                    label: 'Blocked Malicious IPs',
-                    data: [0],
-                    backgroundColor: 'rgba(255, 77, 77, 0.6)',
-                    borderColor: 'rgba(255, 77, 77, 1)',
-                    borderWidth: 1.5
-                }]
-            },
-            options: {
-                responsive: true,
-                animation: false,
-                scales: { y: { beginAtZero: true, suggestedMax: 5, ticks: { precision: 0 } } }
+async def get_dashboard():
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>NETAEGIS // CYBER COMMAND</title>
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+        <style>
+            body { 
+                font-family: 'Share Tech Mono', 'Courier New', monospace; 
+                background-color: #030303; 
+                color: #00FF41; 
+                margin: 0; padding: 20px; 
+                background-image: radial-gradient(circle, #051305 10%, #000000 90%);
             }
-        });
-
-        // 3. Init Line Chart
-        const ctxLine = document.getElementById('trafficChart').getContext('2d');
-        const maxPoints = 15;
-        const lineLabels = Array(maxPoints).fill('');
-        const lineData = Array(maxPoints).fill(0);
-
-        const trafficChart = new Chart(ctxLine, {
-            type: 'line',
-            data: {
-                labels: lineLabels,
-                datasets: [{
-                    label: 'Incoming Packets/sec',
-                    data: lineData,
-                    fill: true,
-                    backgroundColor: 'rgba(77, 166, 255, 0.2)',
-                    borderColor: '#4da6ff',
-                    tension: 0.3
-                }]
-            },
-            options: {
-                responsive: true,
-                animation: false,
-                scales: { y: { beginAtZero: true, suggestedMax: 100 } }
+            .header { 
+                display: flex; justify-content: space-between; align-items: center; 
+                margin-bottom: 20px; border-bottom: 2px solid #00FF41; padding-bottom: 10px; 
+                text-shadow: 0 0 10px #00FF41;
             }
-        });
+            .header h1 { margin: 0; font-size: 26px; letter-spacing: 2px; }
+            .header h1 span { animation: blink 1s infinite; }
+            .status-badge { 
+                background-color: #000; color: #00FF41; 
+                padding: 6px 15px; border: 1px solid #00FF41; 
+                box-shadow: 0 0 10px #00FF41; font-weight: bold;
+                animation: pulse 2s infinite;
+            }
+            @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+            @keyframes pulse { 0% { box-shadow: 0 0 5px #00FF41; } 50% { box-shadow: 0 0 20px #00FF41; } 100% { box-shadow: 0 0 5px #00FF41; } }
+            
+            .grid-container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 20px; }
+            .card { 
+                background-color: rgba(0, 10, 0, 0.8); border: 1px solid #004400; 
+                border-radius: 4px; padding: 18px; 
+                box-shadow: inset 0 0 15px #001100, 0 0 10px #002200;
+                position: relative; overflow: hidden;
+            }
+            .card::before {
+                content: ""; position: absolute; top: 0; left: 0; width: 100%; height: 2px;
+                background: linear-gradient(90deg, transparent, #00FF41, transparent);
+            }
+            .card h3 { 
+                margin-top: 0; color: #00FF41; border-bottom: 1px dashed #004400; 
+                padding-bottom: 8px; font-size: 16px; text-transform: uppercase; 
+            }
+            
+            .ip-list { max-height: 180px; overflow-y: auto; list-style: none; padding: 0; margin: 0; }
+            .ip-item { 
+                color: #FF003C; background: rgba(255,0,60,0.1); 
+                padding: 8px; margin-bottom: 6px; border-left: 3px solid #FF003C; 
+                font-size: 14px; text-shadow: 0 0 5px #FF003C;
+            }
+            
+            .heatmap-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; margin-top: 10px; }
+            .cell { 
+                padding: 15px 0; text-align: center; font-size: 12px; 
+                color: #004400; background-color: #001100; transition: all 0.2s ease;
+                border: 1px solid #003300; border-radius: 2px;
+            }
+            
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 14px; }
+            th, td { padding: 10px 12px; text-align: left; border-bottom: 1px dashed #004400; }
+            th { color: #00FF41; text-transform: uppercase; }
+            .status-allowed { color: #00FF41; }
+            .status-blocked { color: #FF003C; font-weight: bold; text-shadow: 0 0 8px #FF003C; animation: flash 1s infinite; }
+            @keyframes flash { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+            
+            ::-webkit-scrollbar { width: 8px; }
+            ::-webkit-scrollbar-track { background: #001100; }
+            ::-webkit-scrollbar-thumb { background: #00FF41; }
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h1>>_ NETAEGIS_SYS_ROOT<span>_</span></h1>
+            <span class="status-badge" id="ws-badge">SYS.DEFENSE.ACTIVE</span>
+        </div>
 
-        // 4. Update Function (Fetches fresh telemetry every second)
-        async function updateDashboard() {
-            try {
-                const res = await fetch('/api/stats');
-                const data = await res.json();
+        <div class="grid-container">
+            <div class="card">
+                <h3>[!] QUARANTINED THREATS</h3>
+                <ul class="ip-list" id="threat-list"></ul>
+            </div>
+            <div class="card">
+                <h3>[~] LIVE NETWORK TELEMETRY</h3>
+                <canvas id="trafficChart" height="150"></canvas>
+            </div>
+        </div>
 
-                // Update Threat Logs
-                const threatLogs = document.getElementById('threatLogs');
-                if (!data.blocked_ips || data.blocked_ips.length === 0) {
-                    threatLogs.innerHTML = '<li style="color: #00cc66; font-weight: 500;">No attacks detected. Network is secure.</li>';
-                } else {
-                    threatLogs.innerHTML = data.blocked_ips.map(ip => `<li style="color: #ff4d4d; margin-bottom: 8px; font-weight: 500;">🔥 Blocked IP: ${ip}</li>`).join('');
-                }
+        <div class="grid-container">
+            <div class="card">
+                <h3>[*] DYNAMIC IP HEATMAP (NODE INTENSITY)</h3>
+                <div class="heatmap-grid" id="heatmap"></div>
+            </div>
+            <div class="card">
+                <h3>[#] MITIGATION ANALYTICS</h3>
+                <canvas id="summaryChart" height="150"></canvas>
+            </div>
+        </div>
 
-                // Update Bar Chart
-                attackChart.data.datasets[0].data[0] = data.blocked_count;
-                attackChart.update();
+        <div class="card">
+            <h3>[>>] RAW TRAFFIC STREAM LOG</h3>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Source Node</th>
+                        <th>Classification</th>
+                        <th>Firewall Action</th>
+                    </tr>
+                </thead>
+                <tbody id="live-stream-body">
+                    <tr><td colspan="3" style="text-align:center; color:#004400;">Awaiting packet interception...</td></tr>
+                </tbody>
+            </table>
+        </div>
 
-                // Update Line Chart
-                lineData.shift();
-                lineData.push(data.current_pps);
-                
-                if (data.has_threat) {
-                    trafficChart.data.datasets[0].borderColor = '#ff4d4d';
-                    trafficChart.data.datasets[0].backgroundColor = 'rgba(255, 77, 77, 0.2)';
-                } else {
-                    trafficChart.data.datasets[0].borderColor = '#4da6ff';
-                    trafficChart.data.datasets[0].backgroundColor = 'rgba(77, 166, 255, 0.2)';
-                }
+        <script>
+            Chart.defaults.color = '#00FF41';
+            Chart.defaults.font.family = "'Share Tech Mono', 'Courier New', monospace";
+
+            const heatmapEl = document.getElementById('heatmap');
+            for(let i=1; i<=16; i++) {
+                const cell = document.createElement('div');
+                cell.className = 'cell';
+                cell.id = `cell-${i}`;
+                cell.innerText = `0x0${i.toString(16).toUpperCase()}`;
+                heatmapEl.appendChild(cell);
+            }
+
+            const ctxTraffic = document.getElementById('trafficChart').getContext('2d');
+            const trafficChart = new Chart(ctxTraffic, {
+                type: 'line',
+                data: {
+                    labels: Array(15).fill(''),
+                    datasets: [{
+                        label: 'Pkts/Sec',
+                        data: Array(15).fill(45),
+                        borderColor: '#00FF41',
+                        backgroundColor: 'rgba(0, 255, 65, 0.1)',
+                        borderWidth: 2,
+                        pointBackgroundColor: '#000',
+                        pointBorderColor: '#00FF41',
+                        fill: true,
+                        tension: 0.1
+                    }]
+                },
+                options: { responsive: true, scales: { y: { beginAtZero: true, grid: { color: '#003300' } }, x: { grid: { color: '#003300' } } }, plugins: { legend: { display: false } } }
+            });
+
+            const ctxSummary = document.getElementById('summaryChart').getContext('2d');
+            const summaryChart = new Chart(ctxSummary, {
+                type: 'bar',
+                data: {
+                    labels: ['Blocked IPs', 'Total Attack Events'],
+                    datasets: [{ 
+                        label: 'Metrics', 
+                        data: [0, 0], 
+                        backgroundColor: ['rgba(255, 0, 60, 0.8)', 'rgba(0, 255, 65, 0.8)'],
+                        borderColor: ['#FF003C', '#00FF41'],
+                        borderWidth: 1
+                    }]
+                },
+                options: { responsive: true, scales: { y: { beginAtZero: true, grid: { color: '#003300' } }, x: { grid: { display: false } } }, plugins: { legend: { display: false } } }
+            });
+
+            const ws = new WebSocket(`ws://${location.host}/ws`);
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+
+                // Threat Logs Update
+                const threatList = document.getElementById('threat-list');
+                threatList.innerHTML = data.blocked_ips.map(ip => `<li class="ip-item">ACCESS_DENIED: ${ip}</li>`).join('');
+
+                // Traffic Chart Update
+                trafficChart.data.datasets[0].data.shift();
+                trafficChart.data.datasets[0].data.push(data.current_pps);
+                let isThreat = data.current_pps > 200;
+                trafficChart.data.datasets[0].borderColor = isThreat ? '#FF003C' : '#00FF41';
+                trafficChart.data.datasets[0].backgroundColor = isThreat ? 'rgba(255, 0, 60, 0.15)' : 'rgba(0, 255, 65, 0.1)';
                 trafficChart.update();
 
-                // Update Heatmap Cells
+                // Dynamic Analytics Update
+                summaryChart.data.datasets[0].data[0] = data.blocked_count;
+                summaryChart.data.datasets[0].data[1] = data.total_events;
+                summaryChart.update();
+
+                // Dynamic Heatmap Logic
                 data.heatmap.forEach((val, idx) => {
-                    if (data.has_threat && (idx === 4 || idx === 5 || idx === 6)) {
-                        cells[idx].style.backgroundColor = `rgba(255, 77, 77, ${val / 100})`;
+                    const cell = document.getElementById(`cell-${idx+1}`);
+                    if(val > 0) {
+                        let isHigh = val > 50 || data.has_threat;
+                        cell.style.backgroundColor = isHigh ? `rgba(255, 0, 60, ${val/100 + 0.2})` : `rgba(0, 255, 65, ${val/100 + 0.2})`;
+                        cell.style.borderColor = isHigh ? '#FF003C' : '#00FF41';
+                        cell.style.color = '#FFF';
+                        cell.style.boxShadow = isHigh ? '0 0 15px #FF003C' : '0 0 10px #00FF41';
                     } else {
-                        cells[idx].style.backgroundColor = `rgba(0, ${Math.floor(val * 2.5 + 50)}, 102, 0.8)`;
+                        cell.style.backgroundColor = '#001100';
+                        cell.style.borderColor = '#003300';
+                        cell.style.color = '#004400';
+                        cell.style.boxShadow = 'none';
                     }
                 });
-            } catch (err) {
-                console.error("Error updating dashboard stats:", err);
-            }
-        }
 
-        // Run update once immediately, then loop every 1000ms (1 second)
-        updateDashboard();
-        setInterval(updateDashboard, 1000);
-    </script>
-</body>
-</html>"""
+                // Live Stream Update
+                const streamBody = document.getElementById('live-stream-body');
+                if(data.live_stream && data.live_stream.length > 0) {
+                    streamBody.innerHTML = data.live_stream.map(item => `
+                        <tr>
+                            <td>${item.ip}</td>
+                            <td>${item.type}</td>
+                            <td class="${item.status === 'BLOCKED' ? 'status-blocked' : 'status-allowed'}">[${item.status}]</td>
+                        </tr>
+                    `).join('');
+                }
+            };
+        </script>
+    </body>
+    </html>
+    """
     return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
