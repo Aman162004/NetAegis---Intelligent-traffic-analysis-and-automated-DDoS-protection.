@@ -25,3 +25,7 @@ mitigation/__pycache__/
 pcap_captures/
 mitigation/__pycache__/
 *.pyc
+
+pcap_captures/
+mitigation/__pycache__/
+*.pyc
