@@ -14,3 +14,10 @@
 pkg/
 src/
 .env
+pcap_captures/
+__pycache__/
+*.pyc
+
+pcap_captures/
+mitigation/__pycache__/
+*.pyc
